@@ -1,0 +1,129 @@
+{
+  "name": "Selecionar e Postar",
+  "nodes": [
+    {
+      "id": "721b60db-8ec9-465a-80ee-6c2469db00f7",
+      "name": "Agendamento",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 30, "triggerAtMinute": 20 }] }
+      }
+    },
+    {
+      "id": "69204e9c-0022-46de-a78b-2ad4937ef7ad",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0],
+      "parameters": {
+        "includeOtherFields": true,
+        "assignments": {
+          "assignments": [
+            { "id": "1", "name": "evolutionApiUrl", "type": "string", "value": "https://SEU-DOMINIO-EVOLUTION.com" },
+            { "id": "2", "name": "evolutionInstance", "type": "string", "value": "SEU_INSTANCE_NAME" },
+            { "id": "3", "name": "groupJid", "type": "string", "value": "SEU_GRUPO_JID@g.us" },
+            { "id": "4", "name": "amazonAffiliateTag", "type": "string", "value": "SEUTAG-20" }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "dd4fc4ad-0a8e-4a50-9c24-cd954045b67b",
+      "name": "Buscar Melhores Candidatos",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [440, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT dc.platform, dc.product_id, dc.product_url, dc.product_name, dc.image_url, dc.current_price, dc.original_price, dc.discount_pct, dc.coupon_code\nFROM deal_candidates dc\nLEFT JOIN posted_deals pd ON pd.platform = dc.platform AND pd.product_id = dc.product_id\nWHERE dc.found_at > now() - interval '35 minutes'\n  AND (pd.product_id IS NULL OR dc.current_price < pd.last_posted_price)\nORDER BY dc.discount_pct DESC\nLIMIT 5;",
+        "options": {}
+      }
+    },
+    {
+      "id": "c774fdd9-cdf7-497c-83be-306519d92edf",
+      "name": "SplitInBatches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [660, 0],
+      "parameters": { "batchSize": 1, "options": {} }
+    },
+    {
+      "id": "9f3b25be-7721-4e11-8f86-8a66bc37d867",
+      "name": "Gerar Link e Mensagem",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 120],
+      "parameters": {
+        "jsCode": "// Geração de link de afiliado por plataforma.\n// Amazon: mecanismo simples e já confirmado — concatena a tag na URL do produto.\n// Mercado Livre: AINDA NÃO INTEGRADO. Depende da investigação do Linkbuilder\n// (mercadolivre.com.br/afiliados/linkbuilder#hub) descrita no plano de implementação — até essa\n// tarefa ser concluída, o link do ML sai SEM rastreamento de afiliado (produto normal). Trocar o\n// branch 'ml' abaixo assim que o mecanismo real for identificado.\nconst item = $json;\nlet affiliateUrl;\n\nif (item.platform === 'amazon') {\n  const sep = item.product_url.includes('?') ? '&' : '?';\n  affiliateUrl = `${item.product_url}${sep}tag=${$('Config').first().json.amazonAffiliateTag}`;\n} else {\n  affiliateUrl = item.product_url; // TODO: link de afiliado ML (ver Task de investigação)\n}\n\nconst storeName = item.platform === 'amazon' ? 'Amazon' : 'Mercado Livre';\nconst emoji = item.discount_pct >= 40 ? '🔥🔥' : '🔥';\n\nlet caption = `${emoji} *${item.product_name}*\\n\\n`;\ncaption += `De ~R$ ${Number(item.original_price).toFixed(2).replace('.', ',')}~\\n`;\ncaption += `Por *R$ ${Number(item.current_price).toFixed(2).replace('.', ',')}* 🔥 (-${Math.round(item.discount_pct)}%)\\n\\n`;\nif (item.coupon_code) {\n  caption += `🎟️ Cupom: ${item.coupon_code}\\n\\n`;\n}\ncaption += `👉 Pegar promoção: ${affiliateUrl}\\n\\n`;\ncaption += `🛒 ${storeName}`;\n\nreturn [{ json: { ...item, affiliate_url: affiliateUrl, caption } }];"
+      }
+    },
+    {
+      "id": "49eddc7d-5ad5-49c4-9cb2-82cdcfc82898",
+      "name": "Postar no Grupo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 120],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.evolutionApiUrl }}/message/sendMedia/{{ $('Config').first().json.evolutionInstance }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { number: $('Config').first().json.groupJid, mediatype: 'image', media: $json.image_url, caption: $json.caption } }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "c7bd7c3e-0a3e-40f7-912d-9602ead60746",
+      "name": "Registrar Postagem",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 120],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO posted_deals (platform, product_id, last_posted_price, last_posted_at)\nVALUES ($1, $2, $3, now())\nON CONFLICT (platform, product_id)\nDO UPDATE SET last_posted_price = EXCLUDED.last_posted_price, last_posted_at = EXCLUDED.last_posted_at;",
+        "options": {
+          "queryReplacement": "={{ [$('Gerar Link e Mensagem').item.json.platform, $('Gerar Link e Mensagem').item.json.product_id, $('Gerar Link e Mensagem').item.json.current_price] }}"
+        }
+      }
+    },
+    {
+      "id": "14cd7404-5ccf-4b9f-9697-a68007490b13",
+      "name": "Limit",
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [900, -120],
+      "parameters": { "maxItems": 1, "keep": "firstItems" }
+    },
+    {
+      "id": "da674d55-20a8-4ae1-85d1-7c56db19fc32",
+      "name": "Fim",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1120, -120],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Agendamento": { "main": [[{ "node": "Config", "type": "main", "index": 0 }]] },
+    "Config": { "main": [[{ "node": "Buscar Melhores Candidatos", "type": "main", "index": 0 }]] },
+    "Buscar Melhores Candidatos": { "main": [[{ "node": "SplitInBatches", "type": "main", "index": 0 }]] },
+    "SplitInBatches": {
+      "main": [
+        [{ "node": "Limit", "type": "main", "index": 0 }],
+        [{ "node": "Gerar Link e Mensagem", "type": "main", "index": 0 }]
+      ]
+    },
+    "Gerar Link e Mensagem": { "main": [[{ "node": "Postar no Grupo", "type": "main", "index": 0 }]] },
+    "Postar no Grupo": { "main": [[{ "node": "Registrar Postagem", "type": "main", "index": 0 }]] },
+    "Registrar Postagem": { "main": [[{ "node": "SplitInBatches", "type": "main", "index": 0 }]] },
+    "Limit": { "main": [[{ "node": "Fim", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "timezone": "America/Sao_Paulo" },
+  "active": false,
+  "pinData": {}
+}

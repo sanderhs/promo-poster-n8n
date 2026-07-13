@@ -1,0 +1,74 @@
+{
+  "name": "Buscar Ofertas ML",
+  "nodes": [
+    {
+      "id": "88170d3e-881a-48fa-a18e-9605cb0279e3",
+      "name": "Agendamento",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 30 }] }
+      }
+    },
+    {
+      "id": "17fdc171-fb8d-4060-8268-9ae163012741",
+      "name": "Buscar Categorias Ativas",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [220, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT keyword FROM search_categories WHERE platform IN ('ml', 'both') AND active = true;",
+        "options": {}
+      }
+    },
+    {
+      "id": "5c7c746d-e10b-43d7-87aa-8e04a5fa4b4f",
+      "name": "Descobrir Ofertas ML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Descoberta de ofertas no Mercado Livre, em duas etapas por keyword:\n// 1) página de listagem/busca (lista.mercadolivre.com.br/{keyword}) com User-Agent de bot de\n//    preview do WhatsApp — devolve um JSON-LD @graph com vários produtos de uma vez (nome,\n//    imagem, preço atual, link), validado em 2026-07-13.\n// 2) pra cada candidato da listagem, busca a página individual do produto (mesmo UA, já validado\n//    no projeto price-monitor-n8n) só pra pegar o preço ORIGINAL — a listagem não traz isso, mas\n//    a página de produto tem um elemento com aria-label=\"Antes: X reais\" quando há desconto ativo.\n// MAX_CANDIDATES_PER_KEYWORD limita quantas páginas de produto buscamos por keyword, pra manter\n// o volume de requisições razoável rodando a cada 30 min.\nconst WA_UA = 'WhatsApp/2.23.20.0 A';\nconst MAX_CANDIDATES_PER_KEYWORD = 15;\nconst MIN_DISCOUNT_PCT = 20;\n\nconst categories = $input.all().map(item => item.json.keyword);\nconst results = [];\n\nfor (const keyword of categories) {\n  let listingHtml;\n  try {\n    listingHtml = await this.helpers.httpRequest({\n      method: 'GET',\n      url: `https://lista.mercadolivre.com.br/${encodeURIComponent(keyword)}`,\n      headers: { 'User-Agent': WA_UA },\n    });\n  } catch (e) {\n    continue; // keyword falhou (rede/bloqueio) — segue pra próxima, não trava a rodada inteira\n  }\n\n  const ldMatches = [...listingHtml.matchAll(/<script[^>]*application\\/ld\\+json[^>]*>(.*?)<\\/script>/gs)];\n  let products = [];\n  for (const m of ldMatches) {\n    try {\n      const data = JSON.parse(m[1]);\n      if (data['@graph']) {\n        products = data['@graph'].filter(x => x['@type'] === 'Product');\n        break;\n      }\n    } catch (e) {\n      // bloco JSON-LD inválido/inesperado — ignora e tenta o próximo\n    }\n  }\n\n  const candidates = products.slice(0, MAX_CANDIDATES_PER_KEYWORD);\n\n  for (const p of candidates) {\n    const url = p.offers && p.offers.url;\n    const currentPrice = p.offers && p.offers.price;\n    if (!url || !currentPrice) continue;\n\n    const idMatch = url.match(/MLB\\d+/);\n    const productId = idMatch ? idMatch[0] : url;\n\n    let detailHtml;\n    try {\n      detailHtml = await this.helpers.httpRequest({\n        method: 'GET',\n        url,\n        headers: { 'User-Agent': WA_UA },\n      });\n    } catch (e) {\n      continue;\n    }\n\n    const beforeMatch = detailHtml.match(/aria-label=\"Antes:\\s*(\\d+)(?:\\s*reais(?:\\s*com\\s*(\\d+)\\s*centavos)?)?\"/);\n    if (!beforeMatch) continue; // sem desconto ativo agora\n\n    const originalPrice = parseFloat(beforeMatch[1]) + (beforeMatch[2] ? parseFloat(beforeMatch[2]) / 100 : 0);\n    if (!(originalPrice > currentPrice)) continue;\n\n    const discountPct = ((originalPrice - currentPrice) / originalPrice) * 100;\n    if (discountPct < MIN_DISCOUNT_PCT) continue;\n\n    results.push({\n      json: {\n        platform: 'ml',\n        product_id: productId,\n        product_url: url,\n        product_name: p.name || '',\n        image_url: p.image || '',\n        current_price: currentPrice,\n        original_price: originalPrice,\n        discount_pct: Math.round(discountPct * 10) / 10,\n      },\n    });\n  }\n}\n\nreturn results;"
+      }
+    },
+    {
+      "id": "e3a4fa4c-5dca-4508-bf00-ff2f71f77519",
+      "name": "Inserir Candidatos",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [660, 0],
+      "parameters": {
+        "operation": "insert",
+        "schema": { "__rl": true, "mode": "list", "value": "public" },
+        "table": { "__rl": true, "mode": "list", "value": "deal_candidates" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "platform": "={{ $json.platform }}",
+            "product_id": "={{ $json.product_id }}",
+            "product_url": "={{ $json.product_url }}",
+            "product_name": "={{ $json.product_name }}",
+            "image_url": "={{ $json.image_url }}",
+            "current_price": "={{ $json.current_price }}",
+            "original_price": "={{ $json.original_price }}",
+            "discount_pct": "={{ $json.discount_pct }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Agendamento": { "main": [[{ "node": "Buscar Categorias Ativas", "type": "main", "index": 0 }]] },
+    "Buscar Categorias Ativas": { "main": [[{ "node": "Descobrir Ofertas ML", "type": "main", "index": 0 }]] },
+    "Descobrir Ofertas ML": { "main": [[{ "node": "Inserir Candidatos", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "timezone": "America/Sao_Paulo" },
+  "active": false,
+  "pinData": {}
+}

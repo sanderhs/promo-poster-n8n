@@ -1,0 +1,74 @@
+{
+  "name": "Buscar Ofertas Amazon",
+  "nodes": [
+    {
+      "id": "fb25c257-24cf-4b7a-910a-984e50bfd734",
+      "name": "Agendamento",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 30, "triggerAtMinute": 10 }] }
+      }
+    },
+    {
+      "id": "4c6cc345-cece-4414-adc4-9db4f33b99de",
+      "name": "Buscar Categorias Ativas",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [220, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT keyword FROM search_categories WHERE platform IN ('amazon', 'both') AND active = true;",
+        "options": {}
+      }
+    },
+    {
+      "id": "c99da581-d30d-4be1-93a6-b987e09bb8ed",
+      "name": "Descobrir Ofertas Amazon",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Descoberta de ofertas na Amazon.com.br: página de busca (amazon.com.br/s?k={keyword}) com\n// User-Agent de navegador comum (caminho leve, sem bot UA especial — validado em 2026-07-13).\n// Diferente do Mercado Livre, a própria página de busca já traz preço atual E preço original\n// (\"De: R$ X\") juntos por item, então não precisa de uma segunda requisição por candidato.\n//\n// A resposta da Amazon vem comprimida (gzip/br) — o node HTTP Request do n8n descomprime\n// automaticamente, então isso só importa se algum dia trocarmos pra fetch cru.\n//\n// Cada card de produto é delimitado por data-asin=\"XXXXXXXXXX\" no HTML — cortamos o documento\n// nesses pontos pra associar nome/preço/imagem corretamente a cada produto (uma regex única sem\n// esses limites misturaria preços de produtos diferentes).\nconst BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';\nconst MAX_CANDIDATES_PER_KEYWORD = 20;\nconst MIN_DISCOUNT_PCT = 20;\n\nfunction parseBRL(str) {\n  return parseFloat(str.replace(/\\./g, '').replace(',', '.'));\n}\n\nconst categories = $input.all().map(item => item.json.keyword);\nconst results = [];\n\nfor (const keyword of categories) {\n  let html;\n  try {\n    html = await this.helpers.httpRequest({\n      method: 'GET',\n      url: `https://www.amazon.com.br/s?k=${encodeURIComponent(keyword)}`,\n      headers: { 'User-Agent': BROWSER_UA },\n    });\n  } catch (e) {\n    continue;\n  }\n\n  const asinPositions = [...html.matchAll(/data-asin=\"([A-Z0-9]{10})\"/g)];\n  const chunks = [];\n  for (let i = 0; i < asinPositions.length && chunks.length < MAX_CANDIDATES_PER_KEYWORD; i++) {\n    const start = asinPositions[i].index;\n    const end = i + 1 < asinPositions.length ? asinPositions[i + 1].index : html.length;\n    chunks.push({ asin: asinPositions[i][1], html: html.slice(start, end) });\n  }\n\n  for (const { asin, html: chunk } of chunks) {\n    const originalMatch = chunk.match(/De:\\s*R\\$\\s*([\\d.,]+)/);\n    if (!originalMatch) continue; // sem desconto ativo nesse item\n\n    const currentMatch = chunk.match(/a-offscreen\">R\\$\\s*([\\d.,]+)<\\/span>/);\n    if (!currentMatch) continue;\n\n    const originalPrice = parseBRL(originalMatch[1]);\n    const currentPrice = parseBRL(currentMatch[1]);\n    if (!(originalPrice > currentPrice)) continue;\n\n    const discountPct = ((originalPrice - currentPrice) / originalPrice) * 100;\n    if (discountPct < MIN_DISCOUNT_PCT) continue;\n\n    const titleMatch = chunk.match(/<img[^>]*alt=\"([^\"]+)\"/);\n    const imageMatch = chunk.match(/<img[^>]*src=\"([^\"]+)\"/);\n\n    results.push({\n      json: {\n        platform: 'amazon',\n        product_id: asin,\n        product_url: `https://www.amazon.com.br/dp/${asin}`,\n        product_name: titleMatch ? titleMatch[1] : '',\n        image_url: imageMatch ? imageMatch[1] : '',\n        current_price: currentPrice,\n        original_price: originalPrice,\n        discount_pct: Math.round(discountPct * 10) / 10,\n      },\n    });\n  }\n}\n\nreturn results;"
+      }
+    },
+    {
+      "id": "058dec2c-de27-4551-84e5-0b1acb95356e",
+      "name": "Inserir Candidatos",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [660, 0],
+      "parameters": {
+        "operation": "insert",
+        "schema": { "__rl": true, "mode": "list", "value": "public" },
+        "table": { "__rl": true, "mode": "list", "value": "deal_candidates" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "platform": "={{ $json.platform }}",
+            "product_id": "={{ $json.product_id }}",
+            "product_url": "={{ $json.product_url }}",
+            "product_name": "={{ $json.product_name }}",
+            "image_url": "={{ $json.image_url }}",
+            "current_price": "={{ $json.current_price }}",
+            "original_price": "={{ $json.original_price }}",
+            "discount_pct": "={{ $json.discount_pct }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Agendamento": { "main": [[{ "node": "Buscar Categorias Ativas", "type": "main", "index": 0 }]] },
+    "Buscar Categorias Ativas": { "main": [[{ "node": "Descobrir Ofertas Amazon", "type": "main", "index": 0 }]] },
+    "Descobrir Ofertas Amazon": { "main": [[{ "node": "Inserir Candidatos", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "timezone": "America/Sao_Paulo" },
+  "active": false,
+  "pinData": {}
+}
