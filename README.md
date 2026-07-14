@@ -39,12 +39,30 @@ Ambas as lógicas de extração foram testadas contra HTML real capturado em 202
 serem escritas nos workflows (não são só sintaticamente válidas — rodaram e extraíram dados
 corretos de verdade).
 
-## Pendência: link de afiliado do Mercado Livre
+## Link de afiliado do Mercado Livre
 
-O node "Gerar Link e Mensagem" (dentro de `selecionar-e-postar.json`) ainda não gera link de
-afiliado real pro Mercado Livre — usa a URL normal do produto até a investigação da ferramenta
-Linkbuilder (`mercadolivre.com.br/afiliados/linkbuilder#hub`) ser concluída. Ver o plano de
-implementação para os passos dessa investigação. A Amazon já funciona (concatena `?tag=` na URL).
+Resolvido em 2026-07-14 via investigação com DevTools na ferramenta Linkbuilder
+(`mercadolivre.com.br/afiliados/linkbuilder#hub`). O node "Gerar Links Afiliados ML" (dentro de
+`selecionar-e-postar.json`, roda antes do loop de postagem) chama em lote a API interna que a
+própria ferramenta usa:
+
+```
+POST https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink
+Body: { "urls": [...], "tag": "SEU_TAG_DE_AFILIADO" }
+```
+
+**Atenção**: autenticação é por **sessão de navegador (cookie + CSRF token)**, não um token de API
+estável — os dois valores (constantes `ML_COOKIE` e `ML_CSRF_TOKEN` no topo do node) precisam ser
+atualizados periodicamente quando a sessão expirar. Processo pra renovar: abrir o Linkbuilder
+logado, DevTools → Network → Fetch/XHR, gerar um link de teste, achar a chamada `createLink`,
+copiar os headers `Cookie` e `X-Csrf-Token` de novo. **Nunca commitar esses valores reais no
+repositório** — só editar direto no node, na instância do n8n. Se a sessão expirar sem você notar,
+o node falha silenciosamente e o link cai pra URL normal do produto (sem afiliado) em vez de
+travar a postagem inteira — vale checar de vez em quando se os posts de ML estão saindo com
+`meli.la/...` (afiliado) ou com o link completo do produto (sessão expirada).
+
+A Amazon é mais simples e não tem essa fragilidade — concatena `?tag=` direto na URL, sem sessão
+nenhuma envolvida.
 
 ## Limitações conhecidas
 

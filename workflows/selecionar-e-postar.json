@@ -43,11 +43,22 @@
       }
     },
     {
+      "id": "f2a1b3c4-5d6e-47f8-9012-3456789abcde",
+      "name": "Gerar Links Afiliados ML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Gera links de afiliado do Mercado Livre em lote, via a API interna usada pelo Linkbuilder\n// (mercadolivre.com.br/afiliados/linkbuilder#hub). Descoberta manualmente via DevTools em\n// 2026-07-14 — não é uma API pública documentada, pode mudar sem aviso.\n//\n// Autenticação por SESSÃO DE NAVEGADOR (cookie + CSRF token), não um token de API estável — os\n// dois valores abaixo precisam ser atualizados periodicamente quando a sessão expirar: abre o\n// Linkbuilder logado, DevTools > Network > Fetch/XHR, gera um link de teste, acha a chamada\n// \"createLink\", copia o header Cookie e o header X-Csrf-Token de novo.\n// NUNCA commitar os valores reais aqui — só editar direto neste node, na instância do n8n.\nconst ML_COOKIE = 'COLE_SEU_COOKIE_AQUI';\nconst ML_CSRF_TOKEN = 'COLE_SEU_CSRF_TOKEN_AQUI';\nconst ML_AFFILIATE_TAG = 'promodasqueridas';\n\nconst items = $input.all();\nconst mlItems = items.filter(i => i.json.platform === 'ml');\n\nconst affiliateMap = {};\nif (mlItems.length > 0) {\n  try {\n    const response = await this.helpers.httpRequest({\n      method: 'POST',\n      url: 'https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink',\n      headers: {\n        'Content-Type': 'application/json',\n        'Cookie': ML_COOKIE,\n        'X-Csrf-Token': ML_CSRF_TOKEN,\n      },\n      body: {\n        urls: mlItems.map(i => i.json.product_url),\n        tag: ML_AFFILIATE_TAG,\n      },\n      json: true,\n    });\n\n    for (const entry of (response.urls || [])) {\n      if (entry.created && entry.short_url) {\n        affiliateMap[entry.origin_url] = entry.short_url;\n      }\n    }\n  } catch (e) {\n    // Falha na geração de link (sessão expirada, etc.) — segue sem link de afiliado ML nessa\n    // rodada, em vez de travar a postagem inteira.\n  }\n}\n\nreturn items.map(item => ({\n  json: {\n    ...item.json,\n    ml_affiliate_url: affiliateMap[item.json.product_url] || null,\n  },\n}));"
+      }
+    },
+    {
       "id": "c774fdd9-cdf7-497c-83be-306519d92edf",
       "name": "SplitInBatches",
       "type": "n8n-nodes-base.splitInBatches",
       "typeVersion": 3,
-      "position": [660, 0],
+      "position": [880, 0],
       "parameters": { "batchSize": 1, "options": {} }
     },
     {
@@ -57,7 +68,7 @@
       "typeVersion": 2,
       "position": [900, 120],
       "parameters": {
-        "jsCode": "// Geração de link de afiliado por plataforma.\n// Amazon: mecanismo simples e já confirmado — concatena a tag na URL do produto.\n// Mercado Livre: AINDA NÃO INTEGRADO. Depende da investigação do Linkbuilder\n// (mercadolivre.com.br/afiliados/linkbuilder#hub) descrita no plano de implementação — até essa\n// tarefa ser concluída, o link do ML sai SEM rastreamento de afiliado (produto normal). Trocar o\n// branch 'ml' abaixo assim que o mecanismo real for identificado.\nconst item = $json;\nlet affiliateUrl;\n\nif (item.platform === 'amazon') {\n  const sep = item.product_url.includes('?') ? '&' : '?';\n  affiliateUrl = `${item.product_url}${sep}tag=${$('Config').first().json.amazonAffiliateTag}`;\n} else {\n  affiliateUrl = item.product_url; // TODO: link de afiliado ML (ver Task de investigação)\n}\n\nconst storeName = item.platform === 'amazon' ? 'Amazon' : 'Mercado Livre';\nconst emoji = item.discount_pct >= 40 ? '🔥🔥' : '🔥';\n\nlet caption = `${emoji} *${item.product_name}*\\n\\n`;\ncaption += `De ~R$ ${Number(item.original_price).toFixed(2).replace('.', ',')}~\\n`;\ncaption += `Por *R$ ${Number(item.current_price).toFixed(2).replace('.', ',')}* 🔥 (-${Math.round(item.discount_pct)}%)\\n\\n`;\nif (item.coupon_code) {\n  caption += `🎟️ Cupom: ${item.coupon_code}\\n\\n`;\n}\ncaption += `👉 Pegar promoção: ${affiliateUrl}\\n\\n`;\ncaption += `🛒 ${storeName}`;\n\nreturn [{ json: { ...item, affiliate_url: affiliateUrl, caption } }];"
+        "jsCode": "// Geração de link de afiliado por plataforma.\n// Amazon: concatena a tag na URL do produto.\n// Mercado Livre: usa o link já gerado em lote pelo node \"Gerar Links Afiliados ML\" (campo\n// ml_affiliate_url). Se vier null (sessão do ML expirada ou item não coberto), cai pra URL normal\n// do produto em vez de travar a postagem inteira.\nconst item = $json;\nlet affiliateUrl;\n\nif (item.platform === 'amazon') {\n  const sep = item.product_url.includes('?') ? '&' : '?';\n  affiliateUrl = `${item.product_url}${sep}tag=${$('Config').first().json.amazonAffiliateTag}`;\n} else {\n  affiliateUrl = item.ml_affiliate_url || item.product_url;\n}\n\nconst storeName = item.platform === 'amazon' ? 'Amazon' : 'Mercado Livre';\nconst emoji = item.discount_pct >= 40 ? '🔥🔥' : '🔥';\n\nlet caption = `${emoji} *${item.product_name}*\\n\\n`;\ncaption += `De ~R$ ${Number(item.original_price).toFixed(2).replace('.', ',')}~\\n`;\ncaption += `Por *R$ ${Number(item.current_price).toFixed(2).replace('.', ',')}* 🔥 (-${Math.round(item.discount_pct)}%)\\n\\n`;\nif (item.coupon_code) {\n  caption += `🎟️ Cupom: ${item.coupon_code}\\n\\n`;\n}\ncaption += `👉 Pegar promoção: ${affiliateUrl}\\n\\n`;\ncaption += `🛒 ${storeName}`;\n\nreturn [{ json: { ...item, affiliate_url: affiliateUrl, caption } }];"
       }
     },
     {
@@ -111,7 +122,8 @@
   "connections": {
     "Agendamento": { "main": [[{ "node": "Config", "type": "main", "index": 0 }]] },
     "Config": { "main": [[{ "node": "Buscar Melhores Candidatos", "type": "main", "index": 0 }]] },
-    "Buscar Melhores Candidatos": { "main": [[{ "node": "SplitInBatches", "type": "main", "index": 0 }]] },
+    "Buscar Melhores Candidatos": { "main": [[{ "node": "Gerar Links Afiliados ML", "type": "main", "index": 0 }]] },
+    "Gerar Links Afiliados ML": { "main": [[{ "node": "SplitInBatches", "type": "main", "index": 0 }]] },
     "SplitInBatches": {
       "main": [
         [{ "node": "Limit", "type": "main", "index": 0 }],
